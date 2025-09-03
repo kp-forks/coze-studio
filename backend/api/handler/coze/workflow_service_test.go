@@ -43,13 +43,14 @@ import (
 	"github.com/cloudwego/hertz/pkg/common/ut"
 	"github.com/cloudwego/hertz/pkg/protocol"
 	"github.com/cloudwego/hertz/pkg/protocol/sse"
-	message0 "github.com/coze-dev/coze-studio/backend/crossdomain/contract/message"
-	"github.com/coze-dev/coze-studio/backend/domain/workflow/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+
+	message0 "github.com/coze-dev/coze-studio/backend/crossdomain/contract/message"
+	"github.com/coze-dev/coze-studio/backend/domain/workflow/config"
 
 	"github.com/coze-dev/coze-studio/backend/api/model/crossdomain/knowledge"
 	modelknowledge "github.com/coze-dev/coze-studio/backend/api/model/crossdomain/knowledge"
@@ -718,12 +719,13 @@ func withSpecificNodeID(id string) func(options *getProcessOptions) {
 }
 
 type exeResult struct {
-	output string
-	status workflow.WorkflowExeStatus
-	event  *workflow.NodeEvent
-	token  *workflow.TokenAndCost
-	t      *testing.T
-	reason string
+	output      string
+	status      workflow.WorkflowExeStatus
+	event       *workflow.NodeEvent
+	token       *workflow.TokenAndCost
+	t           *testing.T
+	reason      string
+	nodeResults []*workflow.NodeResult
 }
 
 func (e *exeResult) assertSuccess() {
@@ -742,6 +744,26 @@ func (e *exeResult) tokenEqual(in, out int) {
 	assert.Equal(e.t, out, outputI)
 }
 
+func (e *exeResult) nodeResultHasResponseExtra(nodeID string, k string, v any) {
+	var n *workflow.NodeResult
+
+	for _, nr := range e.nodeResults {
+		if nr.NodeId == nodeID {
+			n = nr
+			break
+		}
+	}
+
+	if n == nil {
+		e.t.Fatal("node key: ", nodeID, "not found")
+		return
+	}
+	extra := mustUnmarshalToMap(e.t, n.Extra)
+	assert.NotEmpty(e.t, extra)
+	assert.Contains(e.t, extra, "response_extra")
+	assert.Equal(e.t, extra["response_extra"].(map[string]any)[k], v)
+}
+
 func (r *wfTestRunner) getProcess(id, exeID string, opts ...func(options *getProcessOptions)) *exeResult {
 	options := &getProcessOptions{}
 	for _, opt := range opts {
@@ -755,6 +777,8 @@ func (r *wfTestRunner) getProcess(id, exeID string, opts ...func(options *getPro
 	var nodeType string
 	var token *workflow.TokenAndCost
 	var reason string
+	var nodeResults []*workflow.NodeResult
+	var count int
 	for {
 		if nodeEvent != nil {
 			if options.previousInterruptEventID != "" {
@@ -768,6 +792,10 @@ func (r *wfTestRunner) getProcess(id, exeID string, opts ...func(options *getPro
 
 		if workflowStatus != workflow.WorkflowExeStatus_Running {
 			break
+		}
+
+		if count > 1000 {
+			r.t.Fatal("get process for too long")
 		}
 
 		getProcessResp := getProcess(r.t, r.h, id, exeID)
@@ -802,16 +830,22 @@ func (r *wfTestRunner) getProcess(id, exeID string, opts ...func(options *getPro
 		if nodeEvent != nil {
 			eventID = nodeEvent.ID
 		}
+
+		nodeResults = getProcessResp.Data.NodeResults
+
 		r.t.Logf("getProcess output= %s, status= %v, eventID= %s, nodeType= %s", output, workflowStatus, eventID, nodeType)
+
+		count++
 	}
 
 	return &exeResult{
-		output: output,
-		status: workflowStatus,
-		event:  nodeEvent,
-		token:  token,
-		t:      r.t,
-		reason: reason,
+		output:      output,
+		status:      workflowStatus,
+		event:       nodeEvent,
+		token:       token,
+		t:           r.t,
+		reason:      reason,
+		nodeResults: nodeResults,
 	}
 }
 
@@ -1132,7 +1166,8 @@ func TestTestRunAndGetProcess(t *testing.T) {
 
 		mockey.PatchConvey("test run success, then cancel", func() {
 			exeID := r.testRun(id, input)
-			r.getProcess(id, exeID)
+			exeResult := r.getProcess(id, exeID)
+			exeResult.nodeResultHasResponseExtra(entity.ExitNodeKey, "terminal_plan", int64(2))
 
 			// cancel after success, nothing happens
 			r.cancel(id, exeID)
@@ -1366,6 +1401,7 @@ func TestTestResumeWithInputNode(t *testing.T) {
 
 			result := r.getNodeExeHistory(id, exeID, "154951", nil)
 			assert.Equal(t, mustUnmarshalToMap(t, e2.output), mustUnmarshalToMap(t, result.Output))
+			assert.Equal(t, mustUnmarshalToMap(t, e2.output), mustUnmarshalToMap(t, result.Input))
 		})
 
 		mockey.PatchConvey("sync run does not support interrupt", func() {
@@ -1624,6 +1660,7 @@ func TestNestedSubWorkflowWithInterrupt(t *testing.T) {
 			post[workflow.DeleteWorkflowResponse](r, &workflow.DeleteWorkflowRequest{
 				WorkflowID: topID,
 			})
+			time.Sleep(time.Second)
 		}()
 
 		midID := r.load("subworkflow/middle_workflow.json", withID(7494849202016272435))
@@ -1841,6 +1878,7 @@ func TestPublishWorkflow(t *testing.T) {
 			WorkflowID: id,
 		}
 		_ = post[workflow.DeleteWorkflowResponse](r, deleteReq)
+		time.Sleep(time.Second)
 	})
 }
 
@@ -1964,6 +2002,7 @@ func TestSimpleInvokableToolWithReturnVariables(t *testing.T) {
 			post[workflow.DeleteWorkflowResponse](r, &workflow.DeleteWorkflowRequest{
 				WorkflowID: id,
 			})
+			time.Sleep(time.Second)
 		}()
 
 		exeID := r.testRun(id, map[string]string{
@@ -2578,6 +2617,7 @@ func TestAggregateStreamVariables(t *testing.T) {
 		e := r.getProcess(id, exeID)
 		e.assertSuccess()
 		assert.Equal(t, "I won't tell you.\nI won't tell you.\n{\"Group1\":\"I won't tell you.\",\"input\":\"I've got an important question\"}", e.output)
+		e.nodeResultHasResponseExtra(entity.ExitNodeKey, "terminal_plan", int64(2))
 
 		defer r.runServer()()
 
@@ -2628,6 +2668,7 @@ func TestListWorkflowAsToolData(t *testing.T) {
 			WorkflowID: id,
 		}
 		_ = post[workflow.DeleteWorkflowResponse](r, deleteReq)
+		time.Sleep(time.Second)
 	})
 }
 
@@ -2662,6 +2703,7 @@ func TestWorkflowDetailAndDetailInfo(t *testing.T) {
 			WorkflowID: id,
 		}
 		_ = post[workflow.DeleteWorkflowResponse](r, deleteReq)
+		time.Sleep(time.Second)
 	})
 }
 
@@ -4542,6 +4584,8 @@ func TestMoveWorkflowAppToLibrary(t *testing.T) {
 					assert.Equal(t, "v0.0.1", node.Data.Inputs.WorkflowVersion)
 				}
 			}
+
+			time.Sleep(time.Second)
 		})
 
 	})
@@ -4925,6 +4969,44 @@ func TestMessageNodes(t *testing.T) {
 		assert.Equal(t, strconv.FormatInt(mID, 10), result["mID"])
 	})
 
+	mockey.PatchConvey("create assistant message", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+
+		cID := time.Now().Unix()
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: cID,
+		}, nil).AnyTimes()
+		mID := time.Now().Unix()
+		r.message.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&message.Message{
+			ID: mID,
+		}, nil).AnyTimes()
+		rID := time.Now().UnixNano()
+		r.agentRun.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&agententity.RunRecordMeta{
+			ID: rID,
+		}, nil).AnyTimes()
+		r.message.EXPECT().GetLatestRunIDs(gomock.Any(), gomock.Any()).Return([]int64{rID}, nil).AnyTimes()
+		sID := time.Now().UnixNano()
+		r.conversation.EXPECT().GetByID(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID:        cID,
+			SectionID: sID,
+		}, nil).AnyTimes()
+		idStr := r.load("message/create_assistant_message.json")
+		r.publish(idStr, "v0.0.1", true)
+
+		ret, _ := r.openapiSyncRun(idStr, map[string]string{
+			"CONVERSATION_NAME": "name" + strconv.FormatInt(cID, 10),
+		}, withRunProjectID(123))
+		assert.Equal(t, true, ret["output"])
+		assert.Equal(t, strconv.FormatInt(mID, 10), ret["mID"])
+		r.message.EXPECT().GetLatestRunIDs(gomock.Any(), gomock.Any()).Return([]int64{}, nil).AnyTimes()
+		ret, _ = r.openapiSyncRun(idStr, map[string]string{
+			"CONVERSATION_NAME": "name" + strconv.FormatInt(cID, 10),
+		}, withRunProjectID(123))
+		assert.Equal(t, true, ret["output"])
+		assert.Equal(t, strconv.FormatInt(mID, 10), ret["mID"])
+	})
+
 	mockey.PatchConvey("create message in Bot scene", t, func() {
 		r := newWfTestRunner(t)
 		defer r.closeFn()
@@ -5194,7 +5276,7 @@ func TestMessageNodes(t *testing.T) {
 		assert.Contains(t, e.reason, "Message node operation failure: message not found")
 	})
 
-	mockey.PatchConvey("delete message", t, func() {
+	mockey.PatchConvey("delete message in dynamic conversation", t, func() {
 		r := newWfTestRunner(t)
 		defer r.closeFn()
 		cID := time.Now().Unix()
@@ -5224,6 +5306,70 @@ func TestMessageNodes(t *testing.T) {
 		}, withRunProjectID(123))
 
 		assert.Equal(t, true, ret["isSuccess"])
+	})
+
+	mockey.PatchConvey("delete message in static conversation", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().Unix()
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: cID,
+		}, nil).AnyTimes()
+		createReq := &workflow.CreateProjectConversationDefRequest{
+			ProjectID:        "123",
+			ConversationName: "name" + strconv.FormatInt(cID, 10),
+			SpaceID:          "123",
+		}
+		post[workflow.CreateProjectConversationDefResponse](r, createReq)
+		mID := time.Now().Unix()
+		r.message.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&message.Message{
+			ID: mID,
+		}, nil).AnyTimes()
+		rID := time.Now().UnixNano()
+		r.agentRun.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&agententity.RunRecordMeta{
+			ID: rID,
+		}, nil).AnyTimes()
+		sID := time.Now().UnixNano()
+		r.conversation.EXPECT().GetByID(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID:        cID,
+			SectionID: sID,
+		}, nil).AnyTimes()
+		r.message.EXPECT().Delete(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+		idStr := r.load("message/delete_message.json")
+		testInput := map[string]string{
+			"USER_INPUT":        "hello",
+			"CONVERSATION_NAME": "name" + strconv.FormatInt(cID, 10),
+		}
+		exeID := r.testRun(idStr, testInput, withRunProjectID(123))
+		e := r.getProcess(idStr, exeID)
+		e.assertSuccess()
+		output := e.output
+		var result map[string]any
+		err := sonic.Unmarshal([]byte(output), &result)
+		assert.NoError(t, err)
+
+		assert.Equal(t, true, result["isSuccess"])
+	})
+
+	mockey.PatchConvey("create, edit, delete message in agent default conversation", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		idStr := r.load("message/agent_message.json")
+
+		testInput := map[string]string{
+			"CONVERSATION_NAME": "Default",
+		}
+		exeID := r.testRun(idStr, testInput)
+		e := r.getProcess(idStr, exeID)
+		output := e.output
+		var result map[string]any
+		err := sonic.Unmarshal([]byte(output), &result)
+		assert.NoError(t, err, "Failed to unmarshal output JSON")
+
+		assert.Equal(t, false, result["create_success"])
+		assert.Equal(t, false, result["edit_success"])
+		assert.Equal(t, false, result["delete_success"])
 	})
 }
 
@@ -5489,4 +5635,356 @@ func TestConversationOfChatFlow(t *testing.T) {
 		})
 	})
 
+}
+
+func TestConversationNodes(t *testing.T) {
+	mockey.PatchConvey("create conversation", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().Unix()
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: cID,
+		}, nil).AnyTimes()
+		sID := time.Now().UnixNano()
+		r.conversation.EXPECT().GetByID(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID:        cID,
+			SectionID: sID,
+		}, nil).AnyTimes()
+
+		idStr := r.load("conversation_manager/create_conversation.json")
+		r.publish(idStr, "v0.0.1", true)
+
+		ret, _ := r.openapiSyncRun(idStr, map[string]string{
+			"input": "name" + strconv.FormatInt(cID, 10),
+		}, withRunProjectID(123))
+		assert.Equal(t, strconv.FormatInt(cID, 10), ret["output"])
+	})
+
+	mockey.PatchConvey("update template conversation name", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().Unix()
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: cID,
+		}, nil).AnyTimes()
+
+		// update template name
+		createReq := &workflow.CreateProjectConversationDefRequest{
+			ProjectID:        "123",
+			ConversationName: "template_v1",
+			SpaceID:          "123",
+		}
+		post[workflow.CreateProjectConversationDefResponse](r, createReq)
+		idStr := r.load("conversation_manager/update_conversation.json")
+
+		execID := r.testRun(idStr, map[string]string{}, withRunProjectID(123))
+
+		e := r.getProcess(idStr, execID)
+
+		assert.Equal(t, workflow.WorkflowExeStatus_Fail, e.status)
+		assert.Contains(t, e.reason, "Only conversation created through nodes are allowed to be modified or deleted")
+	})
+
+	mockey.PatchConvey("update & delete dynamic conversation name", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().Unix()
+		appID := time.Now().Unix()
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: cID,
+		}, nil).AnyTimes()
+
+		// create conversation and update conversation name
+		idStr := r.load("conversation_manager/update_dynamic_conversation.json")
+		execID := r.testRun(idStr, map[string]string{
+			"input":    "v1",
+			"new_name": "v2",
+		}, withRunProjectID(appID))
+
+		e := r.getProcess(idStr, execID)
+
+		output := map[string]any{}
+		err := sonic.UnmarshalString(e.output, &output)
+		assert.Nil(t, err)
+		assert.Equal(t, map[string]any{"conversationId": strconv.FormatInt(cID, 10), "isExisted": false, "isSuccess": true}, output["obj"])
+
+		execID = r.testRun(idStr, map[string]string{
+			"input":    "v1",
+			"new_name": "v2",
+		}, withRunProjectID(appID))
+		e = r.getProcess(idStr, execID)
+		output = map[string]any{}
+		err = sonic.UnmarshalString(e.output, &output)
+		assert.Nil(t, err)
+		assert.Equal(t, map[string]any{"conversationId": strconv.FormatInt(cID, 10), "isExisted": true, "isSuccess": false}, output["obj"])
+
+		// create template conversation & delete conversation
+		createReq := &workflow.CreateProjectConversationDefRequest{
+			ProjectID:        strconv.FormatInt(appID, 10),
+			ConversationName: "template_v1",
+			SpaceID:          "123",
+		}
+		_ = post[workflow.CreateProjectConversationDefResponse](r, createReq)
+
+		deleteIDStr := r.load("conversation_manager/delete_conversation.json")
+
+		execID = r.testRun(deleteIDStr, map[string]string{
+			"input": "template_v1",
+		}, withRunProjectID(appID))
+
+		e = r.getProcess(idStr, execID)
+		assert.Equal(t, workflow.WorkflowExeStatus_Fail, e.status)
+		assert.Contains(t, e.reason, "Only conversation created through nodes are allowed to be modified or deleted")
+
+		//delete dynamic conversation
+		execID = r.testRun(deleteIDStr, map[string]string{
+			"input": "v1",
+		}, withRunProjectID(appID))
+
+		e = r.getProcess(idStr, execID)
+		assert.Equal(t, workflow.WorkflowExeStatus_Success, e.status)
+
+		//delete dynamic conversation
+		execID = r.testRun(deleteIDStr, map[string]string{
+			"input": "v2",
+		}, withRunProjectID(appID))
+
+		e = r.getProcess(idStr, execID)
+		assert.Equal(t, workflow.WorkflowExeStatus_Success, e.status)
+
+		execID = r.testRun(idStr, map[string]string{
+			"input":    "v1",
+			"new_name": "v2",
+		}, withRunProjectID(appID))
+		e = r.getProcess(idStr, execID)
+		output = map[string]any{}
+		err = sonic.UnmarshalString(e.output, &output)
+		assert.Nil(t, err)
+		assert.Equal(t, map[string]any{"conversationId": strconv.FormatInt(cID, 10), "isExisted": false, "isSuccess": true}, output["obj"])
+	})
+}
+
+func TestConversationListNodes(t *testing.T) {
+	mockey.PatchConvey("list dynamic conversation", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().UnixNano()
+		appID := cID
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: appID,
+		}, nil).AnyTimes()
+		idStr := r.load("conversation_manager/conversation_list.json")
+		execID := r.testRun(idStr, map[string]string{
+			"CONVERSATION_NAME": "name" + strconv.FormatInt(cID, 10),
+		}, withRunProjectID(appID))
+		e := r.getProcess(idStr, execID)
+		type conversationInfo struct {
+			ConversationName string `json:"conversationName"`
+			ConversationId   string `json:"conversationId"`
+		}
+		var output []conversationInfo
+		err := sonic.UnmarshalString(e.output, &output)
+		assert.Nil(t, err)
+		expected := []conversationInfo{
+			{
+				ConversationId:   strconv.FormatInt(cID, 10),
+				ConversationName: "name" + strconv.FormatInt(cID, 10),
+			},
+		}
+		assert.Equal(t, expected, output)
+	})
+
+	mockey.PatchConvey("list static conversation", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().UnixNano()
+		appID := cID
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: appID,
+		}, nil).AnyTimes()
+		createReq := &workflow.CreateProjectConversationDefRequest{
+			ProjectID:        strconv.FormatInt(appID, 10),
+			ConversationName: "name" + strconv.FormatInt(cID, 10),
+			SpaceID:          "123",
+		}
+		post[workflow.CreateProjectConversationDefResponse](r, createReq)
+		idStr := r.load("conversation_manager/conversation_list.json")
+		execID := r.testRun(idStr, map[string]string{
+			"CONVERSATION_NAME": "name" + strconv.FormatInt(cID, 10),
+		}, withRunProjectID(appID))
+		e := r.getProcess(idStr, execID)
+		type conversationInfo struct {
+			ConversationName string `json:"conversationName"`
+			ConversationId   string `json:"conversationId"`
+		}
+		var output []conversationInfo
+		err := sonic.UnmarshalString(e.output, &output)
+		assert.Nil(t, err)
+		expected := []conversationInfo{
+			{
+				ConversationId:   strconv.FormatInt(cID, 10),
+				ConversationName: "name" + strconv.FormatInt(cID, 10),
+			},
+		}
+		assert.Equal(t, expected, output)
+	})
+}
+
+func TestConversationHistoryNodes(t *testing.T) {
+	mockey.PatchConvey("conversation_history & clear conversation_history for dynamic conversation", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().UnixNano()
+		appID := cID
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: appID,
+		}, nil).AnyTimes()
+		mID := time.Now().Unix()
+		r.message.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&message.Message{
+			ID: mID,
+		}, nil).AnyTimes()
+		rID := time.Now().UnixNano()
+		r.agentRun.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&agententity.RunRecordMeta{
+			ID: rID,
+		}, nil).AnyTimes()
+		sID := time.Now().UnixNano()
+		r.conversation.EXPECT().GetByID(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID:        cID,
+			SectionID: sID,
+		}, nil).AnyTimes()
+		r.message.EXPECT().GetLatestRunIDs(gomock.Any(), gomock.Any()).Return([]int64{rID}, nil).AnyTimes()
+		r.message.EXPECT().GetMessagesByRunIDs(gomock.Any(), gomock.Any()).Return(&message0.GetMessagesByRunIDsResponse{
+			Messages: []*message0.WfMessage{
+				{
+					ID:   mID,
+					Role: schema.User,
+					Text: ptr.Of("你好"),
+				},
+			},
+		}, nil).AnyTimes()
+		r.conversation.EXPECT().ClearConversationHistory(gomock.Any(), gomock.Any()).Return(&conventity.NewConversationCtxResponse{
+			ID: cID,
+		}, nil).AnyTimes()
+
+		idStr := r.load("conversation_manager/conversation_history.json")
+		execID := r.testRun(idStr, map[string]string{
+			"CONVERSATION_NAME": "name" + strconv.FormatInt(cID, 10),
+		}, withRunProjectID(appID))
+		e := r.getProcess(idStr, execID)
+		e.assertSuccess()
+		output := e.output
+		var outputMap map[string]any
+		err := sonic.Unmarshal([]byte(output), &outputMap)
+		assert.Nil(t, err)
+		assert.Equal(t, true, outputMap["isSuccess"])
+		var messageList []any
+		msg := map[string]any{
+			"role":    "user",
+			"content": "你好",
+		}
+		messageList = append(messageList, msg)
+		assert.Equal(t, messageList, outputMap["history_list"])
+	})
+
+	mockey.PatchConvey("conversation_history & clear conversation_history for static conversation", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().UnixNano()
+		appID := cID
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: appID,
+		}, nil).AnyTimes()
+		createReq := &workflow.CreateProjectConversationDefRequest{
+			ProjectID:        strconv.FormatInt(appID, 10),
+			ConversationName: "name" + strconv.FormatInt(cID, 10),
+			SpaceID:          "123",
+		}
+		post[workflow.CreateProjectConversationDefResponse](r, createReq)
+		mID := time.Now().Unix()
+		r.message.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&message.Message{
+			ID: mID,
+		}, nil).AnyTimes()
+		rID := time.Now().UnixNano()
+		r.agentRun.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&agententity.RunRecordMeta{
+			ID: rID,
+		}, nil).AnyTimes()
+		sID := time.Now().UnixNano()
+		r.conversation.EXPECT().GetByID(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID:        cID,
+			SectionID: sID,
+		}, nil).AnyTimes()
+		r.message.EXPECT().GetLatestRunIDs(gomock.Any(), gomock.Any()).Return([]int64{rID}, nil).AnyTimes()
+		r.message.EXPECT().GetMessagesByRunIDs(gomock.Any(), gomock.Any()).Return(&message0.GetMessagesByRunIDsResponse{
+			Messages: []*message0.WfMessage{
+				{
+					ID:   mID,
+					Role: schema.Assistant,
+					Text: ptr.Of("你好, 我是coze"),
+				},
+			},
+		}, nil).AnyTimes()
+		r.conversation.EXPECT().ClearConversationHistory(gomock.Any(), gomock.Any()).Return(&conventity.NewConversationCtxResponse{
+			ID: cID,
+		}, nil).AnyTimes()
+
+		idStr := r.load("conversation_manager/conversation_history.json")
+		execID := r.testRun(idStr, map[string]string{
+			"CONVERSATION_NAME": "name" + strconv.FormatInt(cID, 10),
+		}, withRunProjectID(appID))
+		e := r.getProcess(idStr, execID)
+		e.assertSuccess()
+		output := e.output
+		var outputMap map[string]any
+		err := sonic.Unmarshal([]byte(output), &outputMap)
+		assert.Nil(t, err)
+		assert.Equal(t, true, outputMap["isSuccess"])
+		var messageList []any
+		msg := map[string]any{
+			"role":    "assistant",
+			"content": "你好, 我是coze",
+		}
+		messageList = append(messageList, msg)
+		assert.Equal(t, messageList, outputMap["history_list"])
+	})
+
+	mockey.PatchConvey("conversation_history blank list", t, func() {
+		r := newWfTestRunner(t)
+		defer r.closeFn()
+		cID := time.Now().UnixNano()
+		appID := cID
+		r.conversation.EXPECT().CreateConversation(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID: appID,
+		}, nil).AnyTimes()
+		mID := time.Now().Unix()
+		r.message.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&message.Message{
+			ID: mID,
+		}, nil).AnyTimes()
+		rID := time.Now().UnixNano()
+		r.agentRun.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&agententity.RunRecordMeta{
+			ID: rID,
+		}, nil).AnyTimes()
+		sID := time.Now().UnixNano()
+		r.conversation.EXPECT().GetByID(gomock.Any(), gomock.Any()).Return(&conventity.Conversation{
+			ID:        cID,
+			SectionID: sID,
+		}, nil).AnyTimes()
+		r.message.EXPECT().GetLatestRunIDs(gomock.Any(), gomock.Any()).Return([]int64{}, nil).AnyTimes()
+		r.message.EXPECT().GetMessagesByRunIDs(gomock.Any(), gomock.Any()).Return(&message0.GetMessagesByRunIDsResponse{}, nil).AnyTimes()
+		r.conversation.EXPECT().ClearConversationHistory(gomock.Any(), gomock.Any()).Return(&conventity.NewConversationCtxResponse{
+			ID: cID,
+		}, nil).AnyTimes()
+
+		idStr := r.load("conversation_manager/conversation_history.json")
+		execID := r.testRun(idStr, map[string]string{
+			"CONVERSATION_NAME": "name" + strconv.FormatInt(cID, 10),
+		}, withRunProjectID(appID))
+		e := r.getProcess(idStr, execID)
+		e.assertSuccess()
+		output := e.output
+		var outputMap map[string]any
+		err := sonic.Unmarshal([]byte(output), &outputMap)
+		assert.Nil(t, err)
+		assert.Equal(t, true, outputMap["isSuccess"])
+		assert.Equal(t, []any{}, outputMap["history_list"])
+	})
 }
